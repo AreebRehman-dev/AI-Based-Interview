@@ -36,11 +36,14 @@ class InterviewContext(BaseModel):
     messages: List[dict]
     difficulty: str = "medium"
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health_check():
     """
     Health check endpoint to verify the service is running.
     Returns status and service information.
+
+    HEAD is allowed alongside GET so uptime monitors (which default to
+    HEAD) don't get a 405.
     """
     return {
         "status": "healthy",
