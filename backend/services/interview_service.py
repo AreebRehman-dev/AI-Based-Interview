@@ -280,7 +280,7 @@ class InterviewService:
         
         try:
             completion = self.groq_client.chat.completions.create(
-                model="llama-3.1-8b-instant",
+                model="llama-3.3-70b-versatile",
                 messages=api_messages,
                 temperature=0.6,
                 max_tokens=250,
