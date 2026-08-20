@@ -3,6 +3,8 @@ Unit tests for backend service logic.
 Tests InterviewService and PDFService functions without making real API calls.
 """
 
+import base64
+import io
 import sys
 import os
 from pathlib import Path
@@ -319,29 +321,46 @@ class TestInterviewServiceWithMocking:
         mock_groq_instance.chat.completions.create.assert_called_once()
     
     @patch('services.interview_service.DeepgramClient')
-    @patch('builtins.open', create=True)
-    @patch('os.remove')
-    def test_text_to_speech_calls_deepgram(self, mock_remove, mock_open, mock_deepgram_class):
-        """Test that text_to_speech calls Deepgram API correctly."""
+    def test_text_to_speech_calls_deepgram(self, mock_deepgram_class):
+        """Test that text_to_speech streams audio from Deepgram and base64-encodes it."""
         # Setup mocks
         mock_deepgram_instance = Mock()
         mock_deepgram_class.return_value = mock_deepgram_instance
-        
-        # Mock file operations
-        mock_file = MagicMock()
-        mock_file.read.return_value = b"fake_audio_data"
-        mock_file.__enter__.return_value = mock_file
-        mock_open.return_value = mock_file
-        
+
+        # Deepgram returns the audio as an in-memory stream
+        mock_response = Mock()
+        mock_response.stream = io.BytesIO(b"fake_audio_data")
+        mock_speak = mock_deepgram_instance.speak.v.return_value
+        mock_speak.stream.return_value = mock_response
+
         # Create service
         service = InterviewService(groq_api_key="test", deepgram_api_key="test")
-        
+
         # Call the method
         result = service.text_to_speech("Hello world")
-        
+
         # Assertions
         assert result is not None
         assert isinstance(result, str)  # Should return base64 string
+        assert base64.b64decode(result) == b"fake_audio_data"
+
+        # Audio should never touch the filesystem
+        mock_speak.save.assert_not_called()
+
+        # And it should be requested as MP3, not uncompressed WAV
+        _, options = mock_speak.stream.call_args[0]
+        assert options.encoding == "mp3"
+
+    @patch('services.interview_service.DeepgramClient')
+    def test_text_to_speech_returns_none_on_failure(self, mock_deepgram_class):
+        """TTS failures degrade to a text-only turn rather than breaking it."""
+        mock_deepgram_instance = Mock()
+        mock_deepgram_class.return_value = mock_deepgram_instance
+        mock_deepgram_instance.speak.v.return_value.stream.side_effect = Exception("boom")
+
+        service = InterviewService(groq_api_key="test", deepgram_api_key="test")
+
+        assert service.text_to_speech("Hello world") is None
 
 
 class TestPDFService:
