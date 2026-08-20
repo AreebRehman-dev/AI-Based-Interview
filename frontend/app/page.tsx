@@ -66,7 +66,7 @@ export default function Home() {
   const {
     isRecording,
     isAudioPlaying,
-    playAudio,
+    playStream,
     stopAudio,
     startRecording,
     stopRecording,
@@ -139,12 +139,14 @@ export default function Home() {
       });
 
       const botReply = response.data.response;
-      const audioBase64 = response.data.audio;
 
       setMessages([...newHistory, { role: "assistant", content: botReply }]);
 
-      if (audioBase64) {
-        playAudio(audioBase64);
+      // Speech streams in its own request so the reply renders immediately and
+      // playback starts on the first chunk, instead of the turn blocking until
+      // the whole clip has been synthesized.
+      if (botReply?.trim()) {
+        playStream(`${API_BASE_URL}/speak?text=${encodeURIComponent(botReply)}`);
       }
     } 
     catch (error) {

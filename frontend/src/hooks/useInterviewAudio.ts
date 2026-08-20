@@ -18,6 +18,41 @@ export const useInterviewAudio = () => {
   const audioChunksRef = useRef<Blob[]>([]);
   const audioPlayerRef = useRef<HTMLAudioElement | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
+  const objectUrlRef = useRef<string | null>(null);
+
+  /**
+   * Release the Blob URL backing the last played clip.
+   * Object URLs pin their blob in memory until revoked, so every clip we
+   * create has to be released once playback is over.
+   */
+  const revokeObjectUrl = useCallback((): void => {
+    if (objectUrlRef.current) {
+      URL.revokeObjectURL(objectUrlRef.current);
+      objectUrlRef.current = null;
+    }
+  }, []);
+
+  /**
+   * Tear down an audio element and abort whatever it is still downloading.
+   *
+   * Pausing alone is not enough for a streamed source: the browser keeps
+   * pulling the rest of the clip in the background, which means the speech
+   * service carries on synthesizing audio nobody will hear. Dropping the src
+   * and reloading cancels the request outright.
+   */
+  const releaseAudioElement = useCallback((audio: HTMLAudioElement | null): void => {
+    if (!audio) return;
+
+    // Detach handlers first so aborting the load does not fire onerror
+    audio.onplay = null;
+    audio.onended = null;
+    audio.onerror = null;
+    audio.onpause = null;
+
+    audio.pause();
+    audio.removeAttribute("src");
+    audio.load();
+  }, []);
 
   /**
    * Start recording audio from the user's microphone
@@ -140,16 +175,26 @@ export const useInterviewAudio = () => {
    * 
    * @param base64String - Base64 encoded audio data
    */
-  const playAudio = useCallback((base64String: string): void => {
+  const playAudio = useCallback((base64String: string, mimeType = "audio/mpeg"): void => {
     try {
-      // Stop any currently playing audio
-      if (audioPlayerRef.current) {
-        audioPlayerRef.current.pause();
-        audioPlayerRef.current.currentTime = 0;
+      // Stop whatever was playing, cancelling its download if still streaming
+      releaseAudioElement(audioPlayerRef.current);
+      audioPlayerRef.current = null;
+      revokeObjectUrl();
+
+      // Decode to a Blob URL rather than handing the element a data: URI.
+      // The browser has to parse a data: URI in full before it can start
+      // playing; a Blob URL points at bytes that are already decoded.
+      const binary = atob(base64String);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
       }
 
-      // Create new audio element
-      const audio = new Audio(`data:audio/wav;base64,${base64String}`);
+      const objectUrl = URL.createObjectURL(new Blob([bytes], { type: mimeType }));
+      objectUrlRef.current = objectUrl;
+
+      const audio = new Audio(objectUrl);
       audioPlayerRef.current = audio;
 
       // Set up event handlers
@@ -160,12 +205,14 @@ export const useInterviewAudio = () => {
       audio.onended = () => {
         setIsAudioPlaying(false);
         audioPlayerRef.current = null;
+        revokeObjectUrl();
       };
 
       audio.onerror = (error) => {
         console.error("Error playing audio:", error);
         setIsAudioPlaying(false);
         audioPlayerRef.current = null;
+        revokeObjectUrl();
       };
 
       audio.onpause = () => {
@@ -177,13 +224,71 @@ export const useInterviewAudio = () => {
         console.error("Failed to play audio:", error);
         setIsAudioPlaying(false);
         audioPlayerRef.current = null;
+        revokeObjectUrl();
       });
 
     } catch (error) {
       console.error("Error setting up audio playback:", error);
       setIsAudioPlaying(false);
+      revokeObjectUrl();
     }
-  }, []);
+  }, [releaseAudioElement, revokeObjectUrl]);
+
+  /**
+   * Play audio straight from a streaming URL.
+   *
+   * The <audio> element starts on the first chunk that arrives rather than
+   * waiting for the file to finish, so playback begins as soon as the speech
+   * service emits its first bytes instead of after the whole clip is built.
+   *
+   * @param url - Endpoint streaming audio (chunked audio/mpeg)
+   */
+  const playStream = useCallback((url: string): void => {
+    try {
+      // Stop whatever was playing, cancelling its download if still streaming
+      releaseAudioElement(audioPlayerRef.current);
+      audioPlayerRef.current = null;
+      revokeObjectUrl();
+
+      const audio = new Audio();
+      audio.preload = "auto";
+      audio.src = url;
+      audioPlayerRef.current = audio;
+
+      // Mark the turn as speaking straight away rather than waiting for onplay.
+      // Audio now arrives a beat after the text does, and without this the mic
+      // would re-enable during that gap and let the user talk over the reply.
+      setIsAudioPlaying(true);
+
+      audio.onplay = () => {
+        setIsAudioPlaying(true);
+      };
+
+      audio.onended = () => {
+        setIsAudioPlaying(false);
+        audioPlayerRef.current = null;
+      };
+
+      audio.onerror = () => {
+        console.error("Error streaming audio:", audio.error);
+        setIsAudioPlaying(false);
+        audioPlayerRef.current = null;
+      };
+
+      audio.onpause = () => {
+        setIsAudioPlaying(false);
+      };
+
+      audio.play().catch((error) => {
+        console.error("Failed to play streamed audio:", error);
+        setIsAudioPlaying(false);
+        audioPlayerRef.current = null;
+      });
+    } catch (error) {
+      console.error("Error setting up audio stream:", error);
+      setIsAudioPlaying(false);
+    }
+  }, [releaseAudioElement, revokeObjectUrl]);
 
   /**
    * Stop/interrupt currently playing audio immediately
@@ -195,19 +300,16 @@ export const useInterviewAudio = () => {
    */
   const stopAudio = useCallback((): void => {
     if (audioPlayerRef.current) {
-      // Immediately pause the audio
-      audioPlayerRef.current.pause();
-      
-      // Reset playback position to the beginning
-      audioPlayerRef.current.currentTime = 0;
-      
-      // Clear the reference
+      // Aborts playback and any in-flight stream behind it
+      releaseAudioElement(audioPlayerRef.current);
       audioPlayerRef.current = null;
     }
-    
+
+    revokeObjectUrl();
+
     // Always set state to false when stopping
     setIsAudioPlaying(false);
-  }, []);
+  }, [releaseAudioElement, revokeObjectUrl]);
 
   /**
    * Toggle between recording and not recording
@@ -237,10 +339,23 @@ export const useInterviewAudio = () => {
         mediaStreamRef.current.getTracks().forEach(track => track.stop());
       }
 
-      // Stop any playing audio
-      if (audioPlayerRef.current) {
-        audioPlayerRef.current.pause();
-        audioPlayerRef.current.currentTime = 0;
+      // Stop any playing audio and cancel an in-flight stream
+      const audio = audioPlayerRef.current;
+      if (audio) {
+        audio.onplay = null;
+        audio.onended = null;
+        audio.onerror = null;
+        audio.onpause = null;
+        audio.pause();
+        audio.removeAttribute("src");
+        audio.load();
+        audioPlayerRef.current = null;
+      }
+
+      // Release the last Blob URL
+      if (objectUrlRef.current) {
+        URL.revokeObjectURL(objectUrlRef.current);
+        objectUrlRef.current = null;
       }
     };
   }, []);
@@ -255,6 +370,7 @@ export const useInterviewAudio = () => {
     startRecording,
     stopRecording,
     playAudio,
+    playStream,
     stopAudio,
     toggleRecording,
   };

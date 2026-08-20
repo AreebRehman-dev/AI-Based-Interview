@@ -4,17 +4,70 @@ Handles AI interview logic including prompt generation, Groq API calls, and TTS.
 """
 
 import os
-import uuid
 import base64
 import json
+import logging
 import re
-from typing import List, Dict, Optional, Tuple
+import time
+import weakref
+from typing import Iterator, List, Dict, Optional, Tuple
+import httpx
 from groq import Groq
-from deepgram import DeepgramClient
+from deepgram import DeepgramClient, SpeakOptions
+
+logger = logging.getLogger(__name__)
+
+# Model is a reasoning model: without an explicit effort it burns hundreds of
+# hidden thinking tokens before the first visible one. Interview turns are three
+# sentences, so "low" is all we need.
+CHAT_MODEL = "openai/gpt-oss-120b"
+CHAT_REASONING_EFFORT = "low"
+
+# Reasoning tokens count against the completion budget, so this ceiling covers
+# thinking + the spoken answer. It is a cap, not a target - raising it does not
+# slow anything down, but setting it too low truncates real answers.
+CHAT_MAX_COMPLETION_TOKENS = 800
+
+# Prefill time scales with input size, and these two are pasted by the user, so
+# they are the only unbounded part of the prompt.
+MAX_RESUME_CHARS = 6000
+MAX_JOB_DESCRIPTION_CHARS = 4000
+
+# MP3 instead of WAV: Aura linear16 is ~48KB per second of speech and base64
+# inflates it another 33%, so a 15s answer was shipping ~950KB of JSON.
+#
+# Model is overridable because Deepgram's aura-2 line is generally faster than
+# aura-1; swapping it changes the voice, so it stays opt-in via the environment.
+TTS_MODEL = os.getenv("TTS_MODEL", "aura-asteria-en")
+TTS_ENCODING = "mp3"
+TTS_BIT_RATE = 48000
+TTS_MIME_TYPE = "audio/mpeg"
+TTS_URL = "https://api.deepgram.com/v1/speak"
+
+# Deepgram synthesizes progressively, so the first bytes land in well under a
+# second while the tail of a long answer takes several more. Anything larger
+# than one chunk here just delays playback for no reason.
+TTS_CHUNK_BYTES = 4096
+
+# /speak is reachable from the browser, so the text it will synthesize is capped.
+MAX_SPEECH_CHARS = 2000
+
+
+def _truncate(text: str, limit: int, label: str) -> str:
+    """Cap pasted free text so one oversized paste cannot inflate every turn."""
+    if not text or len(text) <= limit:
+        return text
+
+    logger.info("Truncating %s from %d to %d chars", label, len(text), limit)
+    return text[:limit].rstrip() + "\n[...truncated]"
 
 
 class InterviewService:
-    
+
+    # Flipped off permanently if the API ever rejects the reasoning parameter,
+    # so a model swap degrades to a slower call instead of a broken interview.
+    _supports_reasoning_effort = True
+
     def __init__(self, groq_api_key: Optional[str] = None, deepgram_api_key: Optional[str] = None):
 
         self.groq_api_key = groq_api_key or os.getenv("GROQ_API_KEY")
@@ -258,14 +311,18 @@ class InterviewService:
     ) -> str:
 
         self.candidate_name = candidate_name
-        
+
         # Extract first name only for natural conversation
         first_name = candidate_name.split()[0] if candidate_name else "Candidate"
-        
+
         phase = self.determine_phase(messages)
-        
+
         system_prompt = self.build_interview_system_prompt(
-            job_description, resume_text, first_name, difficulty, phase
+            _truncate(job_description, MAX_JOB_DESCRIPTION_CHARS, "job description"),
+            _truncate(resume_text, MAX_RESUME_CHARS, "resume"),
+            first_name,
+            difficulty,
+            phase,
         )
         
         api_messages_copy = messages.copy()
@@ -279,20 +336,71 @@ class InterviewService:
         api_messages = [{"role": "system", "content": system_prompt}] + api_messages_copy
         
         try:
-            completion = self.groq_client.chat.completions.create(
-                model="openai/gpt-oss-120b",
-                messages=api_messages,
-                temperature=0.6,
-                max_tokens=250,
-                top_p=1,
-                stream=False,
-            )
-            
+            completion = self._create_chat_completion(api_messages)
+
             raw_response = completion.choices[0].message.content
             return self._clean_response_text(raw_response)
-            
+
         except Exception as e:
             raise Exception(f"Groq API call failed: {str(e)}")
+
+    def _create_chat_completion(self, api_messages: List[Dict[str, str]]):
+        """
+        Run the interview-turn completion, logging where Groq spent its time.
+
+        Falls back to a plain call if the deployed model does not accept
+        reasoning_effort, so an unsupported parameter cannot break every turn.
+        """
+        kwargs = dict(
+            model=CHAT_MODEL,
+            messages=api_messages,
+            temperature=0.6,
+            max_completion_tokens=CHAT_MAX_COMPLETION_TOKENS,
+            top_p=1,
+            stream=False,
+        )
+
+        started = time.perf_counter()
+        try:
+            if self._supports_reasoning_effort:
+                completion = self.groq_client.chat.completions.create(
+                    reasoning_effort=CHAT_REASONING_EFFORT, **kwargs
+                )
+            else:
+                completion = self.groq_client.chat.completions.create(**kwargs)
+        except Exception as e:
+            if self._supports_reasoning_effort and "reasoning" in str(e).lower():
+                logger.warning(
+                    "Model rejected reasoning_effort, retrying without it: %s", e
+                )
+                type(self)._supports_reasoning_effort = False
+                completion = self.groq_client.chat.completions.create(**kwargs)
+            else:
+                raise
+
+        self._log_completion_timing("chat", completion, time.perf_counter() - started)
+        return completion
+
+    @staticmethod
+    def _log_completion_timing(label: str, completion, wall_seconds: float) -> None:
+        """
+        Log Groq's own stage timings next to wall clock.
+
+        queue/prompt/completion time say whether the model or the network is the
+        bottleneck, which is the number you want before tuning anything else.
+        """
+        usage = getattr(completion, "usage", None)
+        logger.info(
+            "[timing] %s wall=%.2fs queue=%.2fs prompt=%.2fs completion=%.2fs "
+            "prompt_tokens=%s completion_tokens=%s",
+            label,
+            wall_seconds,
+            getattr(usage, "queue_time", 0.0) or 0.0,
+            getattr(usage, "prompt_time", 0.0) or 0.0,
+            getattr(usage, "completion_time", 0.0) or 0.0,
+            getattr(usage, "prompt_tokens", "?"),
+            getattr(usage, "completion_tokens", "?"),
+        )
     
     def _sanitize_for_speech(self, text: str) -> str:
         """
@@ -350,33 +458,165 @@ class InterviewService:
         return text.strip()
     
     def text_to_speech(self, text: str) -> Optional[str]:
+        """
+        Synthesize speech and return it base64-encoded.
+
+        Streams the audio straight into memory as MP3. The previous version
+        wrote an uncompressed WAV to disk, read it back, then deleted it - three
+        round trips through the filesystem plus a payload roughly ten times
+        larger than it needed to be.
+        """
         try:
             sanitized_text = self._sanitize_for_speech(text)
-            
-            options = {
-                "model": "aura-asteria-en",
-            }
-            
-            filename = f"temp_{uuid.uuid4()}.wav"
-            
-            # Correct v3 syntax for TTS
-            self.deepgram_client.speak.v("1").save(filename, {"text": sanitized_text}, options)
-            
-            # Read the saved audio file
-            with open(filename, "rb") as audio_file:
-                audio_data = audio_file.read()
-                base64_audio = base64.b64encode(audio_data).decode("utf-8")
-            
-            # Clean up the temporary file
-            if os.path.exists(filename):
-                os.remove(filename)
-            
-            return base64_audio
-            
+
+            options = SpeakOptions(
+                model=TTS_MODEL,
+                encoding=TTS_ENCODING,
+                bit_rate=TTS_BIT_RATE,
+            )
+
+            started = time.perf_counter()
+            response = self.deepgram_client.speak.v("1").stream(
+                {"text": sanitized_text}, options
+            )
+            audio_data = response.stream.getvalue()
+
+            logger.info(
+                "[timing] tts wall=%.2fs chars=%d bytes=%d",
+                time.perf_counter() - started,
+                len(sanitized_text),
+                len(audio_data),
+            )
+
+            return base64.b64encode(audio_data).decode("utf-8")
+
         except Exception as e:
-            print(f"TTS Error: {e}")
+            logger.error("TTS Error: %s", e)
             return None
-    
+
+    def stream_speech(self, text: str) -> Iterator[bytes]:
+        """
+        Yield synthesized speech as it is produced, rather than after it is finished.
+
+        Deepgram already streams /v1/speak back progressively: measurements showed
+        the first audio arriving in ~1s while the rest of a long answer took several
+        more seconds. Buffering the whole body before replying meant the audio for
+        the first sentence sat on the server while the user waited in silence.
+        Forwarding chunks straight through makes time-to-first-audio roughly
+        constant regardless of how long the answer is.
+
+        The connection is opened here rather than inside the generator so that an
+        upstream rejection surfaces as an error the caller can turn into a real
+        status code. Once the response has started streaming it is too late - the
+        client would see a 200 with a truncated body.
+
+        The Deepgram SDK's stream() reads the full response before returning, so
+        this talks to the endpoint directly to keep the stream open.
+        """
+        sanitized_text = self._sanitize_for_speech(text)
+
+        params = {
+            "model": TTS_MODEL,
+            "encoding": TTS_ENCODING,
+            "bit_rate": TTS_BIT_RATE,
+        }
+        headers = {
+            "Authorization": f"Token {self.deepgram_api_key}",
+            "Content-Type": "application/json",
+        }
+
+        started = time.perf_counter()
+        client = httpx.Client(timeout=httpx.Timeout(30.0, connect=10.0))
+
+        try:
+            response = client.send(
+                client.build_request(
+                    "POST",
+                    TTS_URL,
+                    params=params,
+                    headers=headers,
+                    json={"text": sanitized_text},
+                ),
+                stream=True,
+            )
+        except Exception:
+            client.close()
+            raise
+
+        try:
+            response.raise_for_status()
+        except Exception:
+            response.close()
+            client.close()
+            raise
+
+        chunks = self._iter_speech_chunks(
+            response, client, started, len(sanitized_text)
+        )
+
+        # The generator closes the connection in its own finally block, but that
+        # only runs if it was started. If the caller abandons it before the first
+        # chunk - a client that hangs up before the response begins - the socket
+        # to Deepgram would be left open. Tying cleanup to the generator object
+        # itself covers that; both closes are idempotent.
+        weakref.finalize(chunks, self._close_speech_stream, response, client)
+
+        return chunks
+
+    @staticmethod
+    def _close_speech_stream(response: httpx.Response, client: httpx.Client) -> None:
+        """Release an upstream speech connection. Safe to call more than once."""
+        try:
+            response.close()
+        except Exception:
+            pass
+        try:
+            client.close()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _iter_speech_chunks(
+        response: httpx.Response,
+        client: httpx.Client,
+        started: float,
+        char_count: int,
+    ) -> Iterator[bytes]:
+        """Forward audio chunks, then report how the stream actually performed."""
+        first_chunk_at = None
+        total_bytes = 0
+
+        try:
+            for chunk in response.iter_bytes(TTS_CHUNK_BYTES):
+                if not chunk:
+                    continue
+                if first_chunk_at is None:
+                    first_chunk_at = time.perf_counter() - started
+                total_bytes += len(chunk)
+                yield chunk
+
+            logger.info(
+                "[timing] tts stream first_byte=%.2fs total=%.2fs chars=%d bytes=%d",
+                first_chunk_at if first_chunk_at is not None else -1.0,
+                time.perf_counter() - started,
+                char_count,
+                total_bytes,
+            )
+
+        except GeneratorExit:
+            # Client hung up (interrupt, new turn, page closed). Stop pulling from
+            # Deepgram instead of synthesizing audio nobody will hear.
+            logger.info("[timing] tts stream cancelled after %d bytes", total_bytes)
+            raise
+
+        except Exception as e:
+            # Headers are already sent, so the body just ends short here; the
+            # client treats a truncated clip as a turn without full audio.
+            logger.error("TTS stream error after %d bytes: %s", total_bytes, e)
+
+        finally:
+            InterviewService._close_speech_stream(response, client)
+
     def process_interview_turn(
         self,
         resume_text: str,
@@ -386,13 +626,19 @@ class InterviewService:
         difficulty: str = "medium"
     ) -> Tuple[str, Optional[str]]:
         
+        started = time.perf_counter()
+
         response_text = self.generate_interview_response(
             resume_text, job_description, candidate_name, messages, difficulty
         )
-        
-        audio_data = self.text_to_speech(response_text)
-        
-        return response_text, audio_data
+
+        logger.info("[timing] turn total wall=%.2fs", time.perf_counter() - started)
+
+        # Audio is no longer synthesized here. Speech was ~81% of a warm turn and
+        # the client could not hear a syllable until the whole clip was built, so
+        # /chat now returns text immediately and the browser streams the audio
+        # from /speak while it renders.
+        return response_text, None
     
     def build_feedback_system_prompt(self) -> str:
         return """
@@ -493,16 +739,20 @@ class InterviewService:
         api_messages = [{"role": "system", "content": system_prompt}] + messages
         
         try:
+            started = time.perf_counter()
             completion = self.groq_client.chat.completions.create(
-                model="openai/gpt-oss-120b",
+                model=CHAT_MODEL,
                 messages=api_messages,
                 temperature=0.2,
-                max_tokens=1000,
+                max_completion_tokens=2000,
                 top_p=1,
                 stream=False,
                 response_format={"type": "json_object"}
             )
-            
+            self._log_completion_timing(
+                "feedback", completion, time.perf_counter() - started
+            )
+
             feedback_json = completion.choices[0].message.content
             return json.loads(feedback_json)
             

@@ -3,9 +3,13 @@ Audio Processing Service
 Handles speech-to-text (STT) using Deepgram.
 """
 
+import logging
 import os
+import time
 from deepgram import DeepgramClient, PrerecordedOptions, FileSource
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 class AudioService:
@@ -33,9 +37,18 @@ class AudioService:
             )
             
             # Correct v3 syntax for file upload
+            started = time.perf_counter()
             response = self.client.listen.prerecorded.v("1").transcribe_file(payload, options)
-            
+
             transcript = response.results.channels[0].alternatives[0].transcript
+
+            logger.info(
+                "[timing] stt wall=%.2fs audio_bytes=%d transcript_chars=%d",
+                time.perf_counter() - started,
+                len(audio_data),
+                len(transcript or ""),
+            )
+
             return transcript
             
         except Exception as e:
