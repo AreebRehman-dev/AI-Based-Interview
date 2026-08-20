@@ -15,6 +15,7 @@ import {
   AlertDialogTitle,
   AlertDialogOverlay,
 } from "@/components/ui/alert-dialog";
+import { AlertTriangle, CheckCircle2, Sparkles } from "lucide-react";
 
 interface Message {
   role: "user" | "assistant";
@@ -384,21 +385,34 @@ export default function Home() {
   };
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-slate-50 via-slate-50 to-slate-100 flex flex-col">
+    <main className={`min-h-[100dvh] flex flex-col ${step === "interview" ? "" : "app-canvas"}`}>
       {/* Global Header - Conditionally Rendered */}
       {step !== "interview" && (
-        <div className="w-full border-b border-slate-200 bg-white/80 backdrop-blur-sm sticky top-0 z-10">
-          <div className="max-w-4xl mx-auto px-4 py-4 sm:py-6">
-            <div className="flex items-center gap-2">
-              <span className="text-2xl sm:text-3xl font-bold text-slate-900 tracking-tight">
-                AI Interviewer
+        <header className="sticky top-0 z-30 w-full border-b border-slate-900/5 surface-glass">
+          <div className="mx-auto flex max-w-6xl items-center justify-between gap-4 px-4 py-3.5 sm:px-6 sm:py-4">
+            <div className="flex items-center gap-3">
+              <span className="relative flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br from-brand-500 to-brand-700 text-white shadow-[0_6px_18px_-6px_oklch(0.51_0.19_274/0.7)]">
+                <Sparkles className="h-5 w-5" strokeWidth={2.2} />
               </span>
+              <div className="leading-tight">
+                <span className="block text-base font-semibold tracking-tight text-slate-900 sm:text-lg">
+                  AI Interviewer
+                </span>
+                <span className="hidden text-xs text-slate-500 sm:block">
+                  Practice technical interviews with AI-powered feedback
+                </span>
+              </div>
             </div>
-            <p className="text-sm text-slate-600 mt-1">
-              Practice technical interviews with AI-powered feedback
-            </p>
+
+            <span className="hidden items-center gap-2 rounded-full border border-slate-900/5 bg-white/70 px-3 py-1.5 text-xs font-medium text-slate-600 shadow-xs sm:inline-flex">
+              <span className="relative flex h-2 w-2">
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
+                <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-500" />
+              </span>
+              Voice &amp; text ready
+            </span>
           </div>
-        </div>
+        </header>
       )}
 
       {/* Content: remove padding during interview for full-bleed */}
@@ -406,7 +420,7 @@ export default function Home() {
         className={
           step === "interview"
             ? "flex-1 flex w-full p-0"
-            : "flex-1 flex items-center justify-center p-4 sm:p-6 md:p-10"
+            : "relative z-10 flex-1 flex items-start justify-center px-4 pb-20 pt-8 sm:px-6 sm:pt-12 md:pb-24"
         }
       >
         {step === "setup" && (
@@ -441,6 +455,7 @@ export default function Home() {
             onEndInterview={handleEndInterview}
             onExit={handleRestart}
             timeLeft={timeLeft}
+            totalTime={duration * 60}
             formatTime={formatTime}
           />
         )}
@@ -451,8 +466,8 @@ export default function Home() {
       </div>
 
       {step !== "interview" && (
-        <footer className="fixed bottom-0 left-0 w-full py-2 text-center text-slate-400 text-xs bg-white/80 backdrop-blur-sm z-50">
-          Developed by Areeb
+        <footer className="fixed bottom-0 left-0 z-20 w-full border-t border-slate-900/5 surface-glass py-2.5 text-center text-xs text-slate-500">
+          Developed by <span className="font-medium text-slate-700">Areeb</span>
         </footer>
       )}
 
@@ -465,7 +480,20 @@ export default function Home() {
       }}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle className={alertDialog.isError ? "text-red-600" : "text-green-600"}>
+            <span
+              className={`mx-auto flex h-12 w-12 items-center justify-center rounded-full sm:mx-0 ${
+                alertDialog.isError
+                  ? "bg-red-50 text-red-600 ring-1 ring-red-100"
+                  : "bg-emerald-50 text-emerald-600 ring-1 ring-emerald-100"
+              }`}
+            >
+              {alertDialog.isError ? (
+                <AlertTriangle className="h-6 w-6" />
+              ) : (
+                <CheckCircle2 className="h-6 w-6" />
+              )}
+            </span>
+            <AlertDialogTitle className={alertDialog.isError ? "text-red-600" : "text-emerald-600"}>
               {alertDialog.title}
             </AlertDialogTitle>
             <AlertDialogDescription>
@@ -473,10 +501,13 @@ export default function Home() {
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogAction onClick={() => {
-              setAlertDialog({ ...alertDialog, isOpen: false });
-              alertDialog.onConfirm?.();
-            }}>
+            <AlertDialogAction
+              className="btn-brand h-10 w-full px-6 sm:w-auto"
+              onClick={() => {
+                setAlertDialog({ ...alertDialog, isOpen: false });
+                alertDialog.onConfirm?.();
+              }}
+            >
               OK
             </AlertDialogAction>
           </AlertDialogFooter>
